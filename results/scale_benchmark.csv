@@ -1,0 +1,5 @@
+users,repeats,mean_latency_ms,median_latency_ms,min_latency_ms,max_latency_ms,verified_runs,all_runs_verified
+100,3,46.793,46.398,45.988,47.994,3,True
+1000,3,48.284,47.376,46.767,50.708,3,True
+5000,3,58.759,53.76,49.375,73.141,3,True
+10000,3,59.477,60.276,57.831,60.323,3,True

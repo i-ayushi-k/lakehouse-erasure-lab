@@ -10,3 +10,7 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+# Local databases and generated runtime artifacts
+data/processed/*.duckdb
+data/processed/*.duckdb.wal
+results/deletion_audit.jsonl
