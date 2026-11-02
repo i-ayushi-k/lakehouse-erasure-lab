@@ -1,5 +1,5 @@
-users,repeats,mean_latency_ms,median_latency_ms,min_latency_ms,max_latency_ms,verified_runs,all_runs_verified
-100,3,46.793,46.398,45.988,47.994,3,True
-1000,3,48.284,47.376,46.767,50.708,3,True
-5000,3,58.759,53.76,49.375,73.141,3,True
-10000,3,59.477,60.276,57.831,60.323,3,True
+users,repeats,mean_latency_ms,median_latency_ms,min_latency_ms,max_latency_ms,mean_cleanup_latency_ms,verified_runs,all_runs_verified,cleanup_verified_runs,all_cleanups_verified,compute_rate_usd_per_hour,storage_rate_usd_per_gb_month,estimated_deletion_compute_cost_usd,estimated_cleanup_compute_cost_usd,estimated_total_compute_cost_usd,mean_storage_reclaimed_bytes,mean_storage_reclaimed_gb,estimated_monthly_storage_savings_usd,estimated_net_first_month_cost_usd
+100,3,406.026,422.436,361.239,434.403,279.703,3,True,3,True,0.05,0.023,5.6393e-06,3.8848e-06,9.524e-06,0,0.0,0.0,9.524e-06
+1000,3,529.045,497.957,455.426,633.753,367.027,3,True,3,True,0.05,0.023,7.3479e-06,5.0976e-06,1.24454e-05,0,0.0,0.0,1.24454e-05
+5000,3,597.054,621.433,535.862,633.866,341.985,3,True,3,True,0.05,0.023,8.2924e-06,4.7498e-06,1.30422e-05,0,0.0,0.0,1.30422e-05
+10000,3,443.982,476.235,357.303,498.409,273.968,3,True,3,True,0.05,0.023,6.1664e-06,3.8051e-06,9.9715e-06,40102,3.73479e-05,8.59e-07,9.1125e-06
