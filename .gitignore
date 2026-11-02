@@ -14,3 +14,5 @@ Thumbs.db
 data/processed/*.duckdb
 data/processed/*.duckdb.wal
 results/deletion_audit.jsonl
+data/iceberg_catalog.db
+data/iceberg_warehouse/
