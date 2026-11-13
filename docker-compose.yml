@@ -1,0 +1,6 @@
+services:
+  erasure-lab:
+    build: .
+    volumes:
+      # Persist generated results back to the host.
+      - ./results:/app/results

@@ -1,0 +1,19 @@
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+# Local databases and generated runtime artifacts
+data/processed/*.duckdb
+data/processed/*.duckdb.wal
+results/deletion_audit.jsonl
+data/iceberg_catalog.db
+data/iceberg_warehouse/
+results/demo_output.txt

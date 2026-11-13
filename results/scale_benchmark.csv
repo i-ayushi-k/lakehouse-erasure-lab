@@ -1,0 +1,5 @@
+users,repeats,mean_latency_ms,median_latency_ms,min_latency_ms,max_latency_ms,mean_duckdb_latency_ms,mean_iceberg_latency_ms,mean_cleanup_latency_ms,verified_runs,all_runs_verified,cleanup_verified_runs,all_cleanups_verified,residual_copies_after_deletion,residual_copies_after_cleanup,mean_storage_reclaimed_bytes,compute_rate_usd_per_hour,storage_rate_usd_per_gb_month,estimated_total_compute_cost_usd,estimated_monthly_storage_savings_usd
+100,5,92.712,85.838,83.753,118.248,19.29,65.127,69.005,5,True,5,True,2,0,4074.8,0.05,0.023,2.2461e-06,8.73e-08
+1000,5,98.744,92.956,85.141,124.788,19.772,68.846,80.532,5,True,5,True,2,0,15058.4,0.05,0.023,2.4899e-06,3.226e-07
+5000,5,102.252,107.375,82.288,118.639,20.762,73.239,69.43,5,True,5,True,2,0,68676.2,0.05,0.023,2.3845e-06,1.4711e-06
+10000,5,118.399,100.146,91.606,175.909,21.574,88.872,68.066,5,True,5,True,2,0,136481.2,0.05,0.023,2.5898e-06,2.9235e-06
