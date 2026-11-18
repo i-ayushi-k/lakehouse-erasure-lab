@@ -1,4 +1,4 @@
-﻿# Architecture and Design
+# Architecture and Design
 
 ## 1. Purpose
 
@@ -28,12 +28,11 @@ The workflow is divided into current-state deletion and historical cleanup.
 2. Validate that the identifier is not empty.
 3. Count the target user's existing records.
 4. Delete matching records from the four DuckDB current-state tables in a DuckDB transaction.
-5. Invoke the Iceberg deletion operation on the dedicated pipeline table.
-6. Record the operation and its results in the local audit log.
-7. Check whether the target user remains in the current-state tables.
-8. Expire registered historical Parquet copies.
-9. Expire eligible historical Iceberg snapshots and clean up unreferenced local data files in the dedicated demo table.
-10. Verify the checked current-state and historical storage locations.
+5. Invoke the Iceberg deletion operation on the dedicated pipeline table. Iceberg writes a new data file without the user and commits a new snapshot; the previous data file, which still contains the user, stays on disk.
+6. Check the current-state tables, record the operation (including DuckDB and Iceberg timings) in the local audit log, and return. **At this point verification of physical files is expected to fail.**
+7. Separately, expire registered historical Parquet copies.
+8. Expire older Iceberg snapshots (keeping the latest) and delete unreferenced data files in the dedicated demo table's directory.
+9. Run `verify_user_absent`, which checks the four tables, registered Parquet copies, the Iceberg table state and every Parquet file physically present in the Iceberg data directory.
 
 The final verification reports success only when the implemented DuckDB and Iceberg checks succeed.
 
@@ -84,6 +83,10 @@ The implementation is located in:
 ```text
 src/erasure/iceberg_store.py
 ```
+
+All Iceberg paths are absolute and derived from `ICEBERG_DIR` (default `data/`), so behavior does not depend on the working directory; tests and the benchmark override it to use scratch directories.
+
+Implementation note: PyIceberg 0.10.0 keeps `ExpireSnapshots`' pending snapshot-ID set at class level, so IDs leak between operations in one process. `expire_pipeline_history` resets the set on each operation; a regression test covers repeated cleanup in one process.
 
 The dedicated pipeline table is:
 
@@ -166,10 +169,16 @@ Run the pipeline:
 python -m src.erasure.pipeline
 ```
 
-Run the automated tests:
+Run the automated tests (10 tests; each uses isolated DuckDB, Parquet and Iceberg storage):
 
 ```bash
-python -m pytest -v
+python -m pytest -q
+```
+
+Run the benchmark (uses a scratch directory, leaves demo state untouched):
+
+```bash
+python scripts/benchmark.py
 ```
 
 The demonstration generates synthetic records, deletes a selected user, performs historical cleanup, and reports the final verification result.

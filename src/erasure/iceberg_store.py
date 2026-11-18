@@ -1,12 +1,24 @@
 
+"""Local Apache Iceberg integration (SQLite catalog + Parquet data files).
+
+All paths are absolute and derived from ``ICEBERG_DIR`` so behavior does not
+depend on the process working directory. Tests and benchmarks can redirect
+storage by overriding ``ICEBERG_DIR``.
+"""
+
+import os
+import re
 from pathlib import Path
-import pyarrow.parquet as pq
+from urllib.parse import unquote, urlparse
+
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from pyiceberg.catalog import load_catalog
-from pyiceberg.schema import Schema
-from pyiceberg.types import NestedField, StringType, LongType
+from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.partitioning import PartitionSpec
+from pyiceberg.schema import Schema
+from pyiceberg.types import LongType, NestedField, StringType
 
 
 # ==================================================
@@ -15,19 +27,84 @@ from pyiceberg.partitioning import PartitionSpec
 
 ROOT = Path(__file__).resolve().parents[2]
 
-WAREHOUSE = "./data/iceberg_warehouse"
-
-CATALOG = load_catalog(
-    "lakehouse",
-    **{
-        "type": "sql",
-        "uri": "sqlite:///data/iceberg_catalog.db",
-        "warehouse": WAREHOUSE,
-    },
-)
+# Directory holding iceberg_catalog.db and iceberg_warehouse/.
+ICEBERG_DIR = ROOT / "data"
 
 TABLE_NAME = "erasure_lab.users"
 PIPELINE_TABLE_NAME = "erasure_lab.pipeline_users"
+
+
+# --------------------------------------------------
+# Windows path handling
+# --------------------------------------------------
+# On Windows, a file URI such as file:///C:/data/x is parsed by PyIceberg's
+# PyArrow FileIO into the path "/C:/data/x", which Windows rejects with
+# WinError 123. Strip the stray leading slash before a drive letter.
+
+_WINDOWS_DRIVE_PATH = re.compile(r"^/[A-Za-z]:[\\/]")
+
+
+def _strip_drive_slash(path: str) -> str:
+    """Turn '/C:/dir/file' into 'C:/dir/file' on Windows; no-op elsewhere."""
+
+    if os.name == "nt" and _WINDOWS_DRIVE_PATH.match(path):
+        return path[1:]
+
+    return path
+
+
+class LocalFileIO(PyArrowFileIO):
+    """PyArrow FileIO that accepts Windows file:// URIs."""
+
+    @staticmethod
+    def parse_location(location, *args, **kwargs):
+        scheme, netloc, path = PyArrowFileIO.parse_location(
+            location, *args, **kwargs
+        )
+        return scheme, netloc, _strip_drive_slash(path)
+
+
+def get_catalog():
+    """Build the SQLite-backed catalog for the current ICEBERG_DIR."""
+
+    base = Path(ICEBERG_DIR).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    warehouse = base / "iceberg_warehouse"
+    warehouse.mkdir(parents=True, exist_ok=True)
+
+    properties = {
+        "type": "sql",
+        "uri": f"sqlite:///{(base / 'iceberg_catalog.db').as_posix()}",
+        "warehouse": warehouse.as_uri(),
+    }
+
+    if os.name == "nt":
+        properties["py-io-impl"] = "src.erasure.iceberg_store.LocalFileIO"
+
+    return load_catalog("lakehouse", **properties)
+
+
+def pipeline_data_dir() -> Path:
+    """Directory holding the pipeline table's Parquet data files."""
+
+    return (
+        Path(ICEBERG_DIR).resolve()
+        / "iceberg_warehouse"
+        / "erasure_lab"
+        / "pipeline_users"
+        / "data"
+    )
+
+
+def _uri_to_path(raw: str) -> Path:
+    """Convert an Iceberg file location (plain path or file:// URI) to a Path."""
+
+    parsed = urlparse(str(raw))
+
+    if parsed.scheme == "file":
+        return Path(_strip_drive_slash(unquote(parsed.path))).resolve()
+
+    return Path(str(raw)).resolve()
 
 
 # ==================================================
@@ -60,15 +137,16 @@ def arrow_schema():
 def get_or_create_table(table_name):
     """Load an existing Iceberg table or create it."""
 
-    if CATALOG.table_exists(table_name):
-        return CATALOG.load_table(table_name)
+    catalog = get_catalog()
+
+    if catalog.table_exists(table_name):
+        return catalog.load_table(table_name)
 
     namespace = table_name.split(".")[0]
 
-    if not CATALOG.namespace_exists(namespace):
-        CATALOG.create_namespace(namespace)
+    catalog.create_namespace_if_not_exists(namespace)
 
-    return CATALOG.create_table(
+    return catalog.create_table(
         identifier=table_name,
         schema=SCHEMA,
         partition_spec=PartitionSpec(),
@@ -276,13 +354,19 @@ def expire_pipeline_history():
 
         for snapshot_id in old_ids:
 
-            table.maintenance.expire_snapshots().by_id(
-                snapshot_id
-            ).commit()
+            operation = table.maintenance.expire_snapshots()
+
+            # Workaround: PyIceberg (observed in 0.10.0) declares
+            # ExpireSnapshots._snapshot_ids_to_expire as a class-level set,
+            # so IDs from earlier operations in the same process leak into
+            # later commits and fail with "Snapshot ... does not exist".
+            operation._snapshot_ids_to_expire = set()
+
+            operation.by_id(snapshot_id).commit()
 
             expired_ids.append(snapshot_id)
 
-            table = CATALOG.load_table(
+            table = get_catalog().load_table(
                 PIPELINE_TABLE_NAME
             )
 
@@ -292,25 +376,13 @@ def expire_pipeline_history():
     file_records = table.inspect.files().to_pandas()
 
     for raw_path in file_records["file_path"].tolist():
-
-        path = Path(str(raw_path))
-
-        if not path.is_absolute():
-            path = ROOT / path
-
-        active_files.add(path.resolve())
+        active_files.add(_uri_to_path(raw_path))
 
     # Only inspect this dedicated pipeline table directory.
-    data_dir = (
-        ROOT
-        / "data"
-        / "iceberg_warehouse"
-        / "erasure_lab"
-        / "pipeline_users"
-        / "data"
-    )
+    data_dir = pipeline_data_dir()
 
     removed_files = []
+    removed_paths = []
 
     if data_dir.exists():
 
@@ -320,10 +392,12 @@ def expire_pipeline_history():
 
                 path.unlink()
                 removed_files.append(path.name)
+                removed_paths.append(str(path))
 
     return {
         "expired_snapshot_ids": expired_ids,
         "orphan_files_removed": removed_files,
+        "orphan_file_paths_removed": removed_paths,
         "active_data_files": len(active_files),
     }
 
@@ -348,14 +422,7 @@ def verify_pipeline_storage(user_id: str):
 
     remaining_files = []
 
-    data_dir = (
-        ROOT
-        / "data"
-        / "iceberg_warehouse"
-        / "erasure_lab"
-        / "pipeline_users"
-        / "data"
-    )
+    data_dir = pipeline_data_dir()
 
     if data_dir.exists():
 

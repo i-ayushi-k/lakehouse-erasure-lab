@@ -1,218 +1,126 @@
-﻿# Technical Report: User Erasure in a Local Lakehouse Prototype
+### The Right to Be Forgotten in a Lakehouse: Verifying Deletion Across DuckDB, Apache Iceberg, and Parquet
+
+**DuckDB, Apache Iceberg and Parquet: what deletion verifiably removes, and what it leaves behind**
 
 ## Abstract
 
-This project investigates a practical data-engineering problem: a user-level deletion request may need to propagate beyond a primary dataset into derived records, historical copies, and table-format storage.
+A user-erasure request has to reach more than the table a user was loaded into. Derived tables, features, embeddings, exported Parquet copies and table-format history can all still hold the same person's data. This project builds a reproducible local prototype using DuckDB, Apache Iceberg (SQLite catalog and local Parquet files), and Parquet exports, and measures it on synthetic data.
 
-The implementation is a local prototype using DuckDB, Apache Iceberg, and Parquet. It includes a deletion pipeline, current-state verification, historical snapshot cleanup, automated tests, and a synthetic-data benchmark.
+The central finding is that **a successful current-state delete is not, by itself, complete erasure**. In all 20 benchmark runs, deletion left two physical copies of the target user on disk: a Parquet history copy and the superseded Iceberg data file. A separate cleanup step removed those copies. In the latest executed notebook run, mean deletion latency ranged from **92.712 ms to 118.399 ms** across datasets of 100 to 10,000 users. Mean cleanup latency ranged from **68.066 ms to 80.532 ms**. All 20 runs passed deletion verification and all 20 passed post-cleanup verification. These are local prototype measurements, not production performance figures or evidence of legal compliance.
 
-The original recorded DuckDB benchmark shows mean deletion latency between approximately 46.8 ms and 59.5 ms for dataset sizes from 100 to 10,000 records, with all 12 recorded runs passing the implemented verification check. These are baseline measurements from the original local prototype, not performance measurements of the integrated Iceberg implementation.
+## 1. Problem
 
-The project demonstrates selected erasure operations under local test conditions. It does not establish production performance, complete physical erasure across distributed systems, or regulatory compliance.
+Analytical platforms fan data out: a source table feeds derived tables, features and embeddings, while snapshots and exports preserve earlier states. Deleting a row from the source does not automatically remove those other copies. Table formats add a subtler version of the same issue. Iceberg deletes by committing a new snapshot; older data files can remain on disk until old snapshots are expired and unreferenced files are removed.
 
-## 1. Problem Statement
+The lab asks three questions:
 
-Analytical platforms commonly create multiple representations of the same underlying information. A source table may feed derived tables, features, embeddings, exports, and historical snapshots. Removing a user from only the source does not guarantee that their data has disappeared from those other locations.
+1. Can one request remove a user from all simulated current-state stores and be checked afterwards?
+2. How long does deletion take as the dataset grows, and which component dominates?
+3. How many copies remain after deletion, and what removes them?
 
-The goal of this lab is to implement and test a repeatable workflow that deletes a selected synthetic user from several local storage representations, checks the current state, and cleans up historical copies.
+## 2. System
 
-The project also explores Apache Iceberg snapshot management and measures local deletion latency at several dataset sizes.
+**Stores (all local).** Four DuckDB tables represent a source system and downstream copies: `source_records`, `derived_records`, `feature_store`, and `vector_index` (8-dimensional embeddings stored as JSON). A Parquet export of the source table, tracked in `snapshot_catalog`, represents a historical copy. A local Iceberg table, `erasure_lab.pipeline_users`, is held in a SQLite catalog with Parquet data files. The feature and vector stores are simulations; no external feature store or vector database is involved.
 
-## 2. System Design and Implementation
+**Workflow.** `delete_user` validates the ID, counts the user's rows, deletes from the four DuckDB tables in one transaction, then deletes from Iceberg and appends an audit record. `expire_snapshots` removes registered Parquet copies, expires all but the latest Iceberg snapshot, and deletes data files in the pipeline table's directory that the current table state no longer references. `verify_user_absent` checks the four tables, registered Parquet copies, the Iceberg table state, and every Parquet file physically present in the Iceberg data directory.
 
-The project uses Python, DuckDB, Apache Iceberg, and Parquet.
+**No cross-system atomicity.** DuckDB and Iceberg do not share a transaction. If Iceberg fails after DuckDB commits, the result carries the error and `verified_current_state` is false; the prototype does not roll back DuckDB or retry. A test injects this failure.
 
-### 2.1 DuckDB storage
+**Scope of cleanup.** Orphan-file removal is written for this single demo table. It is not a general garbage collector and would be unsafe against concurrent readers or writers.
 
-The pipeline creates synthetic user records and represents four logical storage locations with DuckDB tables:
+## 3. Method
 
-| Table | Purpose |
-|---|---|
-| `source_records` | Source user records |
-| `derived_records` | Downstream derived records |
-| `feature_store` | Simulated feature records |
-| `vector_index` | Simulated vector-related records |
+For each of four dataset sizes (100, 1,000, 5,000 and 10,000 synthetic users), the benchmark runs five independent cycles. Each cycle generates data, deletes one target user, measures residual physical copies, runs cleanup, and measures residual copies again. Each cycle uses a separate scratch directory. The notebook reports the benchmark CSV generated by `scripts/benchmark.py`.
 
-Vector-like values are represented as JSON strings. The feature and vector components are local simulations, not integrations with external production services.
+Recorded metrics include:
 
-### 2.2 Historical Parquet copies
+- deletion latency, split into DuckDB and Iceberg sections;
+- cleanup latency;
+- physical copies of the target user outside active state, before and after cleanup;
+- bytes of Parquet data reclaimed by cleanup.
 
-The project exports a historical Parquet copy and maintains a registry of these copies in `snapshot_catalog`.
+A run counts as cleanup-verified only if no operation reported an error and zero physical copies of the target user remain in the locations checked by the prototype.
 
-The cleanup function attempts to remove registered files and marks successfully removed copies as expired.
-
-This is a simplified historical-copy mechanism. It is separate from Iceberg-managed snapshot metadata.
-
-### 2.3 Apache Iceberg integration
-
-The project includes a local Apache Iceberg implementation in:
-
-`src/erasure/iceberg_store.py`
-
-It uses a local SQLite catalog, a local warehouse, Iceberg table metadata, and Parquet data files.
-
-The dedicated pipeline table is:
-
-`erasure_lab.pipeline_users`
-
-A separate table, `erasure_lab.users`, supports the standalone Iceberg demonstration.
-
-The pipeline synchronizes generated user IDs into the dedicated Iceberg table. During deletion, it removes the target user's records from the current Iceberg table state and verifies the result.
-
-The historical cleanup operation:
-
-1. Expires eligible older Iceberg snapshots while retaining the latest snapshot.
-2. Identifies data files referenced by the active table state.
-3. Identifies unreferenced Parquet data files.
-4. Removes eligible orphan files from the dedicated local demonstration table directory.
-
-This demonstrates the distinction between current-state deletion and historical snapshot maintenance.
-
-**Cross-system limitation:** DuckDB and Iceberg do not share a distributed transaction. The DuckDB transaction can succeed even if the Iceberg operation fails. The implementation records Iceberg errors separately and does not claim atomic deletion across both systems.
-
-The local orphan-file cleanup is designed for the dedicated demonstration table. It is not a general-purpose production garbage collector.
-
-### 2.4 Deletion and verification
-
-The deletion pipeline accepts a user identifier and rejects an empty identifier.
-
-It removes matching records from the four DuckDB current-state tables within a DuckDB transaction, then invokes the Iceberg deletion operation.
-
-Verification checks:
-
-- The target user's row counts in the four DuckDB tables.
-- Remaining registered historical Parquet files.
-- The current Iceberg table state.
-- Remaining physical Iceberg Parquet files containing the target user.
-
-The verification result is limited to the implemented storage locations.
-
-A local JSON Lines audit log records deletion activity, including the request ID, user identifier, timestamp, before-and-after counts, Iceberg result, and verification status.
-
-### 2.5 Test coverage
-
-The test suite includes four cases:
-
-- Deletion from all simulated current-state stores.
-- Removal of the historical Parquet copy during snapshot cleanup.
-- Rejection of an empty user identifier.
-- Idempotent behavior for repeated deletion.
-
-Run the tests using:
-
-```bash
-python -m pytest -v
-```
-
-On the current Windows development environment, all four tests passed after the Iceberg integration and backward-compatible cleanup result fields were added.
-
-These tests validate the behaviors covered by the existing test suite; they do not prove complete erasure from every storage location.
-
-## 3. Experimental Method
-
-The original benchmark driver runs at four synthetic dataset sizes: 100, 1,000, 5,000, and 10,000 records. Each size is repeated three times.
-
-The recorded output includes mean, median, minimum, and maximum latency, along with the number of runs whose verification check succeeded.
-
-The original measurements were collected from the local DuckDB prototype. They should not be interpreted as benchmark results for the integrated Iceberg implementation.
-
-The benchmark is a local experiment rather than a controlled distributed performance study. Timing may vary with the host machine, software environment, background processes, caching, and other factors.
+**Execution environment reported by the executed notebook:** Python 3.12.10, Windows 11, 12 CPUs, DuckDB 1.1.3, PyIceberg 0.10.0, PyArrow 17.0.0, pandas 2.2.3. Five repeats were run for each dataset size. The notebook metadata currently labels the kernel `.venv (3.13.13)`, which conflicts with the executed environment cell's Python 3.12.10. The runtime value is reported here because it is what the notebook printed during execution; confirm the selected kernel before a fresh reproduction.
 
 ## 4. Results
 
-### 4.1 Original DuckDB baseline
+### 4.1 Correctness
 
-| Records | Repeats | Mean latency (ms) | Median latency (ms) | Min (ms) | Max (ms) | Verified |
-|---:|---:|---:|---:|---:|---:|---:|
-| 100 | 3 | 46.793 | 46.398 | 45.988 | 47.994 | 3/3 |
-| 1,000 | 3 | 48.284 | 47.376 | 46.767 | 50.708 | 3/3 |
-| 5,000 | 3 | 58.759 | 53.760 | 49.375 | 73.141 | 3/3 |
-| 10,000 | 3 | 59.477 | 60.276 | 57.831 | 60.323 | 3/3 |
+The notebook reports **20/20 deletion verifications** and **20/20 cleanup verifications**. Every size has five successful deletion runs and five successful cleanup runs. The residual-copy count is two immediately after deletion and zero after cleanup.
 
-All 12 recorded baseline runs passed the implemented verification check.
+### 4.2 Exposure window
 
-Mean latency rose from 46.793 ms at 100 records to 59.477 ms at 10,000 records. Within this limited experiment, latency increased modestly as the synthetic dataset grew.
+| Users | Copies immediately after deletion | Copies after cleanup |
+|---:|---:|---:|
+| 100 | 2 | 0 |
+| 1,000 | 2 | 0 |
+| 5,000 | 2 | 0 |
+| 10,000 | 2 | 0 |
 
-The measurements are not sufficient to infer asymptotic behavior or predict performance at larger scales. Three repetitions per size are also too few for strong statistical conclusions.
+The two copies are the Parquet history file and the pre-delete Iceberg data file. A query against current-state tables can show the user as absent while data remains recoverable from those physical files. The separate cleanup phase removes the copies checked by this prototype.
 
-### 4.2 Integrated implementation demonstration
+### 4.3 Latency
 
-The integrated pipeline was also executed locally with 1,000 synthetic users.
+| Users | Deletion mean (ms) | Median (ms) | Min (ms) | Max (ms) | Cleanup mean (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 92.712 | 85.838 | 83.753 | 118.248 | 69.005 |
+| 1,000 | 98.744 | 92.956 | 85.141 | 124.788 | 80.532 |
+| 5,000 | 102.252 | 107.375 | 82.288 | 118.639 | 69.430 |
+| 10,000 | 118.399 | 100.146 | 91.606 | 175.909 | 68.066 |
 
-The demonstration successfully:
+The Iceberg component accounts for approximately **69.7%–75.1%** of mean deletion latency across the four dataset sizes (using the component means reported by the notebook). The benchmark shows a modest increase in mean deletion latency from 100 to 10,000 users, but the five-repeat sample is small and does not establish asymptotic scaling. At 10,000 users, the maximum deletion latency (175.909 ms) is noticeably above the median (100.146 ms), so the mean should be interpreted alongside the spread.
 
-- Created the DuckDB tables and historical Parquet copy.
-- Synchronized 1,000 user records into the Iceberg pipeline table.
-- Deleted target user `U000007` from the current DuckDB and Iceberg states.
-- Expired the registered DuckDB historical copy.
-- Expired an older Iceberg snapshot.
-- Removed an unreferenced Iceberg Parquet data file.
-- Verified that the target user was absent from the checked current and historical storage locations.
+![Deletion latency by component](deletion_latency.png)
 
-The pipeline reported successful final verification.
+### 4.4 Storage reclaimed and illustrative cost
 
-This is a functional demonstration, not a repeated performance benchmark of the integrated implementation.
+| Users | Mean Parquet data reclaimed | Estimated compute cost | Estimated monthly storage savings |
+|---:|---:|---:|---:|
+| 100 | 4.0 KiB | $0.000002 | $0.00000009 |
+| 1,000 | 14.7 KiB | $0.000002 | $0.00000032 |
+| 5,000 | 67.1 KiB | $0.000002 | $0.00000147 |
+| 10,000 | 133.3 KiB | $0.000003 | $0.00000292 |
 
-### 4.3 Result artifacts
+The notebook uses assumed rates of $0.05 per compute-hour and $0.023 per GB-month. The cost estimates are illustrative accounting outputs at a very small scale, not real cloud billing or a meaningful estimate of production savings.
 
-The repository includes:
+## 5. Discussion
 
-- `results/scale_benchmark.csv`
-- `results/benchmark_summary.csv`
-- `results/deletion_latency.png`
-- `notebooks/results.ipynb`
-- `notebooks/results_executed.ipynb`
+**Delete and erase are different operations.** The clearest result is the exposure window: current-state tables report the user as absent immediately after deletion, while two physical copies remain. The prototype therefore separates current-state deletion from historical cleanup and checks storage files directly.
 
-The original benchmark artifacts should remain labelled as DuckDB baseline results unless they are regenerated using a documented integrated benchmark methodology.
+**Verification must inspect storage, not just queries.** Table queries alone cannot detect every historical copy. Counting the target user's presence in files on disk makes the residual-copy window measurable and verifies that the cleanup phase removed the copies in scope.
 
-## 5. Discussion: Prototype Versus Production Lakehouse
+**Cleanup has a defined boundary.** The prototype verifies the four DuckDB tables, registered Parquet snapshots, Iceberg table state, and Parquet files in the Iceberg data directory. It cannot prove that copies do not exist in unmodelled backups, replicas, logs, caches, exports, or external systems.
 
-The main result is that the project can exercise a multi-store deletion workflow and verify the tested local state.
+## 6. Limitations
 
-The experiment makes an important distinction visible: deleting current rows and removing historical representations are different operations.
+- Data is synthetic and relatively small; measurements are from one Windows machine with five repeats per size.
+- Feature and vector stores are DuckDB tables, not real external services.
+- Backups, replicas, cloud object versions, logs, caches and downstream exports are not modelled.
+- The audit log stores the user ID, which a real system would have to treat as personal data with its own retention rule.
+- Deletion and cleanup run without competing readers or writers.
+- Orphan-file cleanup is specific to the demo table and is not safe as a general concurrent garbage collector.
+- Verification covers only the locations the code checks; it cannot prove that no other copy exists.
+- This prototype is not a GDPR, DPDP or other legal-compliance demonstration.
 
-The DuckDB implementation demonstrates deletion from source, derived, feature-like, and vector-like tables. The Iceberg integration adds table-format snapshot metadata and a separate historical cleanup process.
+## 7. Future work
 
-However, several production challenges remain.
-
-**Partial failure:** DuckDB and Iceberg do not share a distributed transaction. A successful operation in one system does not guarantee success in the other. Production systems would need durable request tracking, retries, and recovery mechanisms.
-
-**External systems:** The feature and vector components are simulated tables. The project does not delete records from real external feature stores or vector databases.
-
-**Historical retention:** The local cleanup demonstration does not cover backups, replicas, cloud object versions, or independently retained downstream exports.
-
-**Concurrency:** The prototype does not implement production-grade coordination with active writers and readers during physical-file cleanup.
-
-**Audit and privacy:** Audit records must be designed carefully so they do not unnecessarily preserve personal information that the erasure request seeks to remove.
-
-A production implementation would require identity verification, authorization, durable request tracking, failure recovery, lineage-based propagation, retention policies, monitoring, and independently verifiable deletion evidence.
-
-## 6. Conclusion and Future Work
-
-This lab delivers a runnable local prototype integrating DuckDB and Apache Iceberg, four passing automated tests, a synthetic-data benchmark baseline, and an executable results notebook.
-
-The integrated demonstration successfully deleted a selected user from the current DuckDB and Iceberg states, expired historical snapshots, cleaned up an eligible local orphan data file, and verified the checked storage locations.
-
-The original benchmark measurements show mean latency below 60 ms for the tested DuckDB baseline. These measurements should not be presented as integrated Iceberg performance results.
-
-Future work should include:
-
-- Failure-injection tests for partial deletion.
-- Durable request tracking and retry handling.
-- Explicit data-lineage tracking.
-- External feature-store and vector-database integrations.
-- Backup and replica coverage.
-- Concurrency-safe historical file cleanup.
-- Repeated benchmarks of the integrated implementation.
-- Independent verification across all relevant storage systems.
-
-The project should be presented as an educational proof of concept for erasure propagation, not as a production deletion service or evidence of legal compliance.
+Future work includes failure injection between phases, retries with stable request IDs, durable request tracking, lineage-driven propagation to derived data, real feature-store and vector-database targets, object-store versioning and backups, concurrency-safe cleanup using catalog maintenance procedures, and larger repeated runs on clearly specified hardware.
 
 ## References
 
-1. Apache Iceberg, "Maintenance — Expire Snapshots." https://iceberg.apache.org/docs/latest/maintenance/
-2. Project source code: `src/erasure/pipeline.py`.
-3. Iceberg integration: `src/erasure/iceberg_store.py`.
-4. Benchmark driver: `scripts/benchmark.py`.
-5. Test suite: `tests/test_pipeline.py`.
-6. Recorded baseline measurements: `results/scale_benchmark.csv`.
+1. Apache Iceberg, “Maintenance: Expire Snapshots.” https://iceberg.apache.org/docs/latest/maintenance/
+2. Project implementation: `src/erasure/pipeline.py`, `src/erasure/iceberg_store.py`; benchmark: `scripts/benchmark.py`; results: `results/scale_benchmark.csv`, `notebooks/results.ipynb`.
+
+
+## Appendix A. Physical file deletion evidence
+
+The executed notebook's cleanup log records the following paths as deleted:
+
+```text
+[parquet_history_copy] data\\processed\\snapshots\\snapshot_d2d7194b520c.parquet
+[iceberg_data_file] data\\iceberg_warehouse\\erasure_lab\\pipeline_users\\data\\00000-0-9abf10a7-fbeb-482f-8f00-30d3157d178b.parquet
+[iceberg_data_file] data\\iceberg_warehouse\\erasure_lab\\pipeline_users\\data\\00000-0-f18b1279-5168-4c49-b262-733747cd547e.parquet
+```
+
+These are the paths printed by the demo cleanup run captured in `results/demo_output.txt`. They provide an example of the physical files removed in that run; the benchmark's aggregate residual-copy counts are reported separately above.

@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import time
 import uuid
@@ -170,6 +171,7 @@ def delete_user(user_id: str) -> dict:
     con = connect()
     iceberg_result = None
     iceberg_error = None
+    duckdb_started = time.perf_counter()
 
     try:
         before = count_user_rows(con, user_id)
@@ -201,11 +203,15 @@ def delete_user(user_id: str) -> dict:
     finally:
         con.close()
 
+    duckdb_ms = (time.perf_counter() - duckdb_started) * 1000
+    iceberg_started = time.perf_counter()
+
     try:
         iceberg_result = delete_pipeline_user(user_id)
     except Exception as exc:
         iceberg_error = str(exc)
 
+    iceberg_ms = (time.perf_counter() - iceberg_started) * 1000
     elapsed_ms = (time.perf_counter() - started) * 1000
 
     duckdb_verified = all(value == 0 for value in after.values())
@@ -227,6 +233,8 @@ def delete_user(user_id: str) -> dict:
             duckdb_verified and iceberg_verified
         ),
         "latency_ms": round(elapsed_ms, 3),
+        "duckdb_latency_ms": round(duckdb_ms, 3),
+        "iceberg_latency_ms": round(iceberg_ms, 3),
         "historical_snapshots_expired": False,
         "note": (
             "Current-state deletion is separate from historical "
@@ -242,12 +250,21 @@ def delete_user(user_id: str) -> dict:
     return result
 
 
+def _display_path(path: Path) -> str:
+    """Project-relative path when possible, absolute otherwise."""
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def expire_snapshots() -> dict:
     """Expire DuckDB snapshots and Iceberg historical snapshots."""
 
     con = connect()
     removed = []
     failures = []
+    deleted_files = []
 
     try:
         snapshots = con.execute(
@@ -262,12 +279,22 @@ def expire_snapshots() -> dict:
             path = Path(raw_path)
 
             try:
-                if path.exists():
+                existed = path.exists()
+
+                if existed:
                     path.unlink()
 
                 if path.exists():
                     failures.append(snapshot_id)
                 else:
+                    if existed:
+                        deleted_files.append(
+                            {
+                                "store": "parquet_history_copy",
+                                "snapshot_id": snapshot_id,
+                                "path": _display_path(path),
+                            }
+                        )
                     con.execute(
                         """
                         UPDATE snapshot_catalog
@@ -292,8 +319,17 @@ def expire_snapshots() -> dict:
     except Exception as exc:
         iceberg_error = str(exc)
 
+    for orphan in (iceberg_cleanup or {}).get("orphan_file_paths_removed", []):
+        deleted_files.append(
+            {
+                "store": "iceberg_data_file",
+                "path": _display_path(Path(orphan)),
+            }
+        )
+
     # Keep original result keys for backward compatibility with tests.
     return {
+        "deleted_files": deleted_files,
         "snapshots_removed": len(removed),
         "snapshot_ids_removed": removed,
         "failures": failures,
@@ -382,19 +418,43 @@ def verify_user_absent(user_id: str) -> dict:
     }
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run the end-to-end erasure demonstration."
+    )
+    parser.add_argument("--users", type=int, default=1000,
+                        help="number of synthetic users (default: 1000)")
+    parser.add_argument("--user-id", default="U000007",
+                        help="user to erase (default: U000007)")
+    args = parser.parse_args(argv)
 
-    created = create_demo_data()
-    target = "U000007"
+    created = create_demo_data(users=args.users)
 
     print("\nDATA CREATED:")
     print(json.dumps(created, indent=2))
 
     print("\nDELETION:")
-    print(json.dumps(delete_user(target), indent=2))
+    print(json.dumps(delete_user(args.user_id), indent=2))
+
+    cleanup = expire_snapshots()
 
     print("\nSNAPSHOT EXPIRY:")
-    print(json.dumps(expire_snapshots(), indent=2))
+    print(json.dumps(cleanup, indent=2))
+
+    print("\nFILES DELETED BY CLEANUP:")
+    if cleanup["deleted_files"]:
+        for item in cleanup["deleted_files"]:
+            print(f"  [{item['store']}] {item['path']}")
+    else:
+        print("  (none)")
 
     print("\nFINAL VERIFICATION:")
-    print(json.dumps(verify_user_absent(target), indent=2))
+    final = verify_user_absent(args.user_id)
+    print(json.dumps(final, indent=2))
+
+    # Non-zero exit code if the checked locations still contain the user.
+    return 0 if final["verified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

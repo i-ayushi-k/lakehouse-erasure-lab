@@ -8,6 +8,10 @@ A reproducible local prototype that shows what a user-erasure request has to tou
 
 ## Architecture
 
+![Architecture diagram](docs/img/architecture.png)
+
+The same flow as an editable Mermaid diagram (renders on GitHub):
+
 ```mermaid
 flowchart LR
     subgraph gen[1. Load synthetic users]
@@ -55,10 +59,11 @@ DuckDB and Iceberg share no transaction. If Iceberg fails after DuckDB commits, 
 
 Requires Python 3.10+ (tested on 3.12), and Git.
 
-### One command (Linux/macOS)
+### One command
 
 ```bash
-./run_all.sh        # venv -> install -> tests -> demo -> benchmark -> executed notebook
+./run_all.sh        # Linux/macOS: venv -> install -> tests -> demo -> benchmark -> executed notebook
+run_all.bat         # Windows CMD, same steps
 ```
 
 or `make setup && source .venv/bin/activate && make all`.
@@ -71,12 +76,14 @@ source .venv/bin/activate            # Windows CMD: .venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt      # includes PyIceberg + SQLAlchemy, pinned
 
-python -m pytest -q                  # 9 tests, ~5 s
+python -m pytest -q                  # 10 tests, ~6 s
 python -m src.erasure.pipeline       # demo: erases U000007
 python scripts/benchmark.py          # ~10 s, writes results/scale_benchmark.csv
 python scripts/create_notebook.py    # (re)build the notebook
-jupyter nbconvert --to notebook --execute --inplace notebooks/results.ipynb
+python -m jupyter nbconvert --to notebook --execute --inplace notebooks/results.ipynb
 ```
+
+The cleanup step prints a `FILES DELETED BY CLEANUP` list with the store type and full path of every file it removes (also returned as `deleted_files` by `expire_snapshots()`), e.g. `[parquet_history_copy] data/processed/snapshots/snapshot_<id>.parquet` and `[iceberg_data_file] data/iceberg_warehouse/erasure_lab/pipeline_users/data/<name>.parquet`.
 
 Demo options: `python -m src.erasure.pipeline --users 5000 --user-id U000042`. The demo exits non-zero if the checked locations still contain the user.
 
@@ -91,7 +98,7 @@ docker compose up --build            # runs tests, demo and benchmark; results l
 | Deliverable | Where |
 |---|---|
 | Architecture diagram + setup | this README, [`docs/architecture.md`](docs/architecture.md) |
-| Reproducible pipeline | `src/erasure/`, `scripts/benchmark.py`, `run_all.sh`, `Makefile`, `Dockerfile`, `docker-compose.yml` |
+| Reproducible pipeline | `src/erasure/`, `scripts/benchmark.py`, `run_all.sh`, `run_all.bat`, `Makefile`, `Dockerfile`, `docker-compose.yml` |
 | Results notebook (executed) | [`notebooks/results.ipynb`](notebooks/results.ipynb) |
 | Technical report (4 pages) | [`reports/technical-report.pdf`](reports/technical-report.pdf) / [`.md`](reports/technical-report.md) |
 | Data card | [`docs/data-card.md`](docs/data-card.md) |
@@ -120,7 +127,7 @@ Five independent runs per size, synthetic data, one machine (1 CPU core, Python 
 | 5,000 | 78.5 | 63.6 | 34.8 | 2 → 0 | 5/5 |
 | 10,000 | 84.8 | 80.1 | 53.9 | 2 → 0 | 5/5 |
 
-Timings vary 20–30% between repeated benchmark runs on the same machine (a second full run gave 59–102 ms mean deletion); the verification outcomes and the 2 → 0 copy counts did not change. About 70% of deletion time is Iceberg; about 20% is the four-table DuckDB transaction. These are local prototype timings, not production performance, and your numbers will differ with hardware. Timings in earlier versions of this README (47–59 ms) came from a different, DuckDB-only benchmark and are not comparable.
+Timings vary roughly 20–40% between repeated benchmark runs on the same machine (later full runs gave mean deletion of 59–102 ms and 68–117 ms); the verification outcomes and the 2 → 0 copy counts did not change. About 70% of deletion time is Iceberg; about 20% is the four-table DuckDB transaction. These are local prototype timings, not production performance, and your numbers will differ with hardware. Timings in earlier versions of this README (47–59 ms) came from a different, DuckDB-only benchmark and are not comparable.
 
 ## Limitations
 

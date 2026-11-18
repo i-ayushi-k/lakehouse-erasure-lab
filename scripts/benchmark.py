@@ -1,232 +1,236 @@
+"""Scale benchmark for the integrated DuckDB + Iceberg erasure pipeline.
+
+Run from the repository root with either:
+    python scripts/benchmark.py
+    python -m scripts.benchmark
+
+For every dataset size the benchmark repeats the full cycle
+(generate -> delete one user -> expire history) and records:
+
+* current-state deletion latency, split into DuckDB and Iceberg parts;
+* historical cleanup latency;
+* how many physical copies of the erased user still exist right after the
+  current-state deletion (the "exposure window") and after cleanup;
+* bytes of Parquet data reclaimed by cleanup.
+
+Everything runs in a scratch directory, so the demo database and Iceberg
+warehouse in ``data/`` are never touched.
+"""
 
 import csv
+import json
+import os
+import platform
+import shutil
 import statistics
+import sys
+import tempfile
 import time
 from pathlib import Path
 
-from src.erasure import pipeline
+# Make ``src`` importable when executed as a plain script.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.erasure import iceberg_store, pipeline  # noqa: E402
 
 SIZES = [100, 1_000, 5_000, 10_000]
-REPEATS = 3
+REPEATS = 5
+SCRATCH_ROOT = None
 
 # Illustrative assumptions, NOT actual cloud billing rates.
 COMPUTE_RATE_USD_PER_HOUR = 0.05
 STORAGE_RATE_USD_PER_GB_MONTH = 0.023
-
 BYTES_PER_GB = 1024 ** 3
 
 
-def get_storage_bytes() -> int:
-    """Measure files in the demo's historical storage locations."""
+def use_scratch_dir(base: Path) -> None:
+    """Give DuckDB and Iceberg separate storage directories."""
 
-    directories = [
-        pipeline.SNAPSHOT_DIR,
-        (
-            pipeline.ROOT
-            / "data"
-            / "iceberg_warehouse"
-            / "erasure_lab"
-            / "pipeline_users"
-        ),
-    ]
+    results = base / "results"
 
+    pipeline.DATA_DIR = base / "data"
+    pipeline.RESULTS_DIR = results
+    pipeline.DB_PATH = pipeline.DATA_DIR / "lakehouse.duckdb"
+    pipeline.SNAPSHOT_DIR = pipeline.DATA_DIR / "snapshots"
+    pipeline.AUDIT_PATH = results / "deletion_audit.jsonl"
+
+    # Keep Iceberg completely separate from DuckDB data.
+    iceberg_store.ICEBERG_DIR = base / "iceberg"
+
+
+def reset_scratch() -> None:
+    """Remove all state between repeats so runs are independent."""
+    shutil.rmtree(pipeline.DATA_DIR, ignore_errors=True)
+
+
+def data_file_bytes() -> int:
+    """Bytes of Parquet data files that can hold personal data.
+
+    Iceberg metadata (manifests, metadata.json) is deliberately excluded:
+    it grows with every commit and would mask the data-file savings.
+    """
     total = 0
-
-    for directory in directories:
+    for directory in (pipeline.SNAPSHOT_DIR, iceberg_store.pipeline_data_dir()):
         if directory.exists():
-            for path in directory.rglob("*"):
-                if path.is_file():
-                    total += path.stat().st_size
-
+            total += sum(p.stat().st_size for p in directory.glob("*.parquet"))
     return total
 
 
+def residual_copies(user_id: str) -> int:
+    """Physical copies of the user outside the active DuckDB/Iceberg state."""
+    check = pipeline.verify_user_absent(user_id)
+    copies = len(check["remaining_snapshot_files"])
+    if check["iceberg"] is not None:
+        copies += len(check["iceberg"]["physical_files_containing_user"])
+    return copies
+
+
 def compute_cost(execution_ms: float) -> float:
-    """Estimate compute cost using the declared hourly rate."""
+    return execution_ms / 3_600_000 * COMPUTE_RATE_USD_PER_HOUR
 
-    execution_hours = execution_ms / 3_600_000
 
-    return execution_hours * COMPUTE_RATE_USD_PER_HOUR
+def one_cycle(users: int, seed: int) -> dict:
+    global SCRATCH_ROOT
+
+    # Every repetition gets a fresh, independent directory.
+    cycle_dir = Path(
+        tempfile.mkdtemp(
+            prefix="cycle_",
+            dir=SCRATCH_ROOT
+        )
+    )
+
+    use_scratch_dir(cycle_dir)
+
+    pipeline.create_demo_data(users=users, seed=seed)
+    target = f"U{users // 2:06d}"
+
+    deletion = pipeline.delete_user(target)
+    residual_before = residual_copies(target)
+    bytes_before = data_file_bytes()
+
+    started = time.perf_counter()
+    cleanup = pipeline.expire_snapshots()
+    cleanup_ms = (time.perf_counter() - started) * 1000
+
+    bytes_after = data_file_bytes()
+    residual_after = residual_copies(target)
+
+    return {
+        "deletion_ms": deletion["latency_ms"],
+        "duckdb_ms": deletion["duckdb_latency_ms"],
+        "iceberg_ms": deletion["iceberg_latency_ms"],
+        "cleanup_ms": cleanup_ms,
+        "deletion_ok": bool(deletion["verified_current_state"]),
+        # Strict: no operation errors AND no physical copy of the user remains.
+        "cleanup_ok": bool(cleanup["verified"]) and residual_after == 0,
+        "residual_before": residual_before,
+        "residual_after": residual_after,
+        "reclaimed_bytes": bytes_before - bytes_after,
+    }
 
 
 def benchmark_one_size(users: int) -> dict:
-    deletion_latencies = []
-    cleanup_latencies = []
+    runs = [one_cycle(users, seed=42 + i) for i in range(REPEATS)]
 
-    deletion_costs = []
-    cleanup_costs = []
+    def col(key):
+        return [r[key] for r in runs]
 
-    reclaimed_bytes = []
-    verified_runs = 0
-    cleanup_verified_runs = 0
-
-    for repeat in range(REPEATS):
-        # Create a fresh synthetic dataset for each repetition.
-        pipeline.create_demo_data(
-            users=users,
-            seed=42 + repeat,
-        )
-
-        target = f"U{users // 2:06d}"
-
-        # Measure storage immediately before deletion and cleanup.
-        storage_before = get_storage_bytes()
-
-        # Measure current-state deletion.
-        deletion_result = pipeline.delete_user(target)
-
-        deletion_ms = deletion_result["latency_ms"]
-        deletion_latencies.append(deletion_ms)
-        deletion_costs.append(compute_cost(deletion_ms))
-
-        if deletion_result["verified_current_state"]:
-            verified_runs += 1
-
-        # Measure historical snapshot and orphan-file cleanup separately.
-        cleanup_started = time.perf_counter()
-
-        cleanup_result = pipeline.expire_snapshots()
-
-        cleanup_ms = (
-            time.perf_counter() - cleanup_started
-        ) * 1000
-
-        cleanup_latencies.append(cleanup_ms)
-        cleanup_costs.append(compute_cost(cleanup_ms))
-
-        if cleanup_result["verified"]:
-            cleanup_verified_runs += 1
-
-        # Measure physical storage after cleanup.
-        storage_after = get_storage_bytes()
-
-        reclaimed = max(0, storage_before - storage_after)
-        reclaimed_bytes.append(reclaimed)
-
-    mean_deletion_cost = statistics.mean(deletion_costs)
-    mean_cleanup_cost = statistics.mean(cleanup_costs)
-
-    mean_reclaimed_bytes = statistics.mean(reclaimed_bytes)
-    mean_reclaimed_gb = mean_reclaimed_bytes / BYTES_PER_GB
-
-    monthly_storage_savings = (
-        mean_reclaimed_gb * STORAGE_RATE_USD_PER_GB_MONTH
-    )
-
-    total_compute_cost = (
-        mean_deletion_cost + mean_cleanup_cost
-    )
-
-    net_first_month_cost = (
-        total_compute_cost - monthly_storage_savings
-    )
+    mean_del = statistics.mean(col("deletion_ms"))
+    mean_clean = statistics.mean(col("cleanup_ms"))
+    reclaimed = statistics.mean(col("reclaimed_bytes"))
+    reclaimed_gb = reclaimed / BYTES_PER_GB
+    compute_total = compute_cost(mean_del) + compute_cost(mean_clean)
+    monthly_savings = reclaimed_gb * STORAGE_RATE_USD_PER_GB_MONTH
 
     return {
         "users": users,
         "repeats": REPEATS,
-
-        "mean_latency_ms": round(
-            statistics.mean(deletion_latencies), 3
-        ),
-        "median_latency_ms": round(
-            statistics.median(deletion_latencies), 3
-        ),
-        "min_latency_ms": round(min(deletion_latencies), 3),
-        "max_latency_ms": round(max(deletion_latencies), 3),
-
-        "mean_cleanup_latency_ms": round(
-            statistics.mean(cleanup_latencies), 3
-        ),
-
-        "verified_runs": verified_runs,
-        "all_runs_verified": verified_runs == REPEATS,
-
-        "cleanup_verified_runs": cleanup_verified_runs,
-        "all_cleanups_verified": (
-            cleanup_verified_runs == REPEATS
-        ),
-
+        "mean_latency_ms": round(mean_del, 3),
+        "median_latency_ms": round(statistics.median(col("deletion_ms")), 3),
+        "min_latency_ms": round(min(col("deletion_ms")), 3),
+        "max_latency_ms": round(max(col("deletion_ms")), 3),
+        "mean_duckdb_latency_ms": round(statistics.mean(col("duckdb_ms")), 3),
+        "mean_iceberg_latency_ms": round(statistics.mean(col("iceberg_ms")), 3),
+        "mean_cleanup_latency_ms": round(mean_clean, 3),
+        "verified_runs": sum(col("deletion_ok")),
+        "all_runs_verified": all(col("deletion_ok")),
+        "cleanup_verified_runs": sum(col("cleanup_ok")),
+        "all_cleanups_verified": all(col("cleanup_ok")),
+        "residual_copies_after_deletion": statistics.mean(col("residual_before")),
+        "residual_copies_after_cleanup": statistics.mean(col("residual_after")),
+        "mean_storage_reclaimed_bytes": round(reclaimed, 2),
         "compute_rate_usd_per_hour": COMPUTE_RATE_USD_PER_HOUR,
-        "storage_rate_usd_per_gb_month": (
-            STORAGE_RATE_USD_PER_GB_MONTH
-        ),
-
-        "estimated_deletion_compute_cost_usd": round(
-            mean_deletion_cost, 10
-        ),
-        "estimated_cleanup_compute_cost_usd": round(
-            mean_cleanup_cost, 10
-        ),
-        "estimated_total_compute_cost_usd": round(
-            total_compute_cost, 10
-        ),
-
-        "mean_storage_reclaimed_bytes": round(
-            mean_reclaimed_bytes, 2
-        ),
-        "mean_storage_reclaimed_gb": round(
-            mean_reclaimed_gb, 10
-        ),
-
-        "estimated_monthly_storage_savings_usd": round(
-            monthly_storage_savings, 10
-        ),
-
-        "estimated_net_first_month_cost_usd": round(
-            net_first_month_cost, 10
-        ),
+        "storage_rate_usd_per_gb_month": STORAGE_RATE_USD_PER_GB_MONTH,
+        "estimated_total_compute_cost_usd": round(compute_total, 10),
+        "estimated_monthly_storage_savings_usd": round(monthly_savings, 10),
     }
 
 
-def main():
-    output = (
-        pipeline.ROOT
-        / "results"
-        / "scale_benchmark.csv"
-    )
+def environment() -> dict:
+    import duckdb
+    import pandas
+    import pyarrow
+    import pyiceberg
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "cpu_count": os.cpu_count(),
+        "duckdb": duckdb.__version__,
+        "pyiceberg": pyiceberg.__version__,
+        "pyarrow": pyarrow.__version__,
+        "pandas": pandas.__version__,
+        "sizes": SIZES,
+        "repeats": REPEATS,
+    }
 
-    rows = []
+
+def main() -> None:
+    results_dir = pipeline.ROOT / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    scratch = Path(tempfile.mkdtemp(prefix="erasure_bench_"))
+    SCRATCH_ROOT = scratch
 
     print("LAKEHOUSE ERASURE BENCHMARK")
     print("===========================")
-    print(f"Dataset sizes: {SIZES}")
-    print(f"Repetitions per size: {REPEATS}")
-    print(
-        "Illustrative compute rate: "
-        f"${COMPUTE_RATE_USD_PER_HOUR}/hour"
-    )
-    print(
-        "Illustrative storage rate: "
-        f"${STORAGE_RATE_USD_PER_GB_MONTH}/GB-month"
-    )
+    print(f"Dataset sizes: {SIZES}   repeats per size: {REPEATS}")
+    print(f"Scratch directory: {scratch}")
 
-    for size in SIZES:
-        print(f"\nBenchmarking {size:,} users...")
+    try:
+        # Warm-up (not recorded): imports, catalog creation, filesystem cache.
+        one_cycle(100, seed=0)
 
-        row = benchmark_one_size(size)
-        rows.append(row)
+        rows = []
+        for size in SIZES:
+            print(f"Benchmarking {size:,} users...", flush=True)
+            row = benchmark_one_size(size)
+            rows.append(row)
+            print(
+                f"  deletion {row['mean_latency_ms']} ms "
+                f"(duckdb {row['mean_duckdb_latency_ms']} / "
+                f"iceberg {row['mean_iceberg_latency_ms']}), "
+                f"cleanup {row['mean_cleanup_latency_ms']} ms, "
+                f"copies {row['residual_copies_after_deletion']} -> "
+                f"{row['residual_copies_after_cleanup']}, "
+                f"verified {row['verified_runs']}/{REPEATS}"
+            )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
-        for key, value in row.items():
-            print(f"{key}: {value}")
-
-    with output.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=rows[0].keys(),
-        )
+    output = results_dir / "scale_benchmark.csv"
+    with output.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"\nSaved benchmark results to: {output}")
+    (results_dir / "benchmark_environment.json").write_text(
+        json.dumps(environment(), indent=2) + "\n", encoding="utf-8"
+    )
+
+    print(f"\nSaved: {output}")
 
 
 if __name__ == "__main__":
     main()
-

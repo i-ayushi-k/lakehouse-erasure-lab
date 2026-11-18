@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.pytest_cache/
+data/processed/*.duckdb*
+data/processed/snapshots/
+data/iceberg_*
